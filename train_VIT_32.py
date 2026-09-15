@@ -24,15 +24,21 @@ DATASET_ROOT = Path(
 )
 
 TRAIN_DIR = DATASET_ROOT / "train_data"
-TEST_DIR = DATASET_ROOT / "test_data"
 
+# Training crop size
 CROP_SIZE = 512
+
+# ViT-B/32
 PATCH_SIZE = 32
 
-# Explicit ImageNet-1k pretrained ViT-B/32
 MODEL_NAME = "vit_base_patch32_224.augreg_in1k"
 
+# Training batch size
 BATCH_SIZE = 4
+
+# Full validation images can have different dimensions
+VAL_BATCH_SIZE = 1
+
 NUM_WORKERS = 2
 
 EPOCHS = 50
@@ -61,6 +67,7 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 # ============================================================
 
 def seed_everything(seed=42):
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -73,53 +80,43 @@ seed_everything(SEED)
 
 
 # ============================================================
-# Dataset
+# Training dataset
 # ============================================================
 
-class ShanghaiTechDensityDataset(Dataset):
+class ShanghaiTechTrainDataset(Dataset):
     """
-    Loads:
-        images/IMG_X.jpg
-        density_maps/IMG_X.npy
+    Training dataset.
 
     Training:
-        random 512x512 crop
-        random horizontal flip
+        - load full image
+        - random 512x512 crop
+        - random horizontal flip
+        - ImageNet normalization
 
-    Validation:
-        center 512x512 crop
-
-    Important:
-        The exact same spatial operations are applied to the image
-        and density map.
+    The same spatial operations are applied to image
+    and density map.
     """
 
     def __init__(
         self,
         split_dir,
-        image_files=None,
+        image_files,
         crop_size=512,
-        train=True,
     ):
         super().__init__()
 
         self.split_dir = Path(split_dir)
+
         self.image_dir = self.split_dir / "images"
         self.density_dir = self.split_dir / "density_maps"
 
-        self.crop_size = crop_size
-        self.train = train
+        self.image_files = list(image_files)
 
-        if image_files is None:
-            self.image_files = sorted(
-                self.image_dir.glob("*.jpg")
-            )
-        else:
-            self.image_files = list(image_files)
+        self.crop_size = crop_size
 
         if len(self.image_files) == 0:
             raise RuntimeError(
-                f"No images found in {self.image_dir}"
+                "Training dataset contains no images."
             )
 
     def __len__(self):
@@ -130,8 +127,8 @@ class ShanghaiTechDensityDataset(Dataset):
         image_path = self.image_files[index]
 
         density_path = (
-            self.density_dir /
-            f"{image_path.stem}.npy"
+            self.density_dir
+            / f"{image_path.stem}.npy"
         )
 
         if not density_path.exists():
@@ -139,89 +136,110 @@ class ShanghaiTechDensityDataset(Dataset):
                 f"Density map not found: {density_path}"
             )
 
-        # ------------------------------------------------------
+        # --------------------------------------------------------
         # Load image
-        # ------------------------------------------------------
-        image = Image.open(image_path).convert("RGB")
+        # --------------------------------------------------------
 
-        # [3, H, W], range [0, 1]
-        image = TF.pil_to_tensor(image).float() / 255.0
+        image = Image.open(
+            image_path
+        ).convert("RGB")
 
-        # ------------------------------------------------------
+        image = (
+            TF.pil_to_tensor(image).float()
+            / 255.0
+        )
+
+        # --------------------------------------------------------
         # Load density map
-        # ------------------------------------------------------
-        density = np.load(density_path)
+        # --------------------------------------------------------
+
+        density = np.load(
+            density_path
+        ).astype(np.float32)
 
         if density.ndim != 2:
             raise ValueError(
-                f"Expected 2D density map, got "
-                f"{density.shape} for {density_path}"
+                f"Expected 2D density map, "
+                f"got {density.shape} "
+                f"for {density_path}"
             )
 
         density = torch.from_numpy(
-            density.astype(np.float32)
+            density
         ).unsqueeze(0)
 
-        # [1, H, W]
+        # --------------------------------------------------------
+        # Check alignment
+        # --------------------------------------------------------
 
-        # ------------------------------------------------------
-        # Check spatial alignment
-        # ------------------------------------------------------
         _, image_h, image_w = image.shape
         _, density_h, density_w = density.shape
 
-        if (image_h, image_w) != (density_h, density_w):
+        if (
+            image_h != density_h
+            or image_w != density_w
+        ):
             raise ValueError(
                 f"Image/density size mismatch:\n"
-                f"{image_path}: {(image_h, image_w)}\n"
-                f"{density_path}: {(density_h, density_w)}"
+                f"{image_path}: "
+                f"{(image_h, image_w)}\n"
+                f"{density_path}: "
+                f"{(density_h, density_w)}"
             )
 
-        # ------------------------------------------------------
-        # Pad if image is smaller than crop
-        # Normally not needed for ShanghaiTech Part B,
-        # but makes the loader robust.
-        # ------------------------------------------------------
-        pad_h = max(0, self.crop_size - image_h)
-        pad_w = max(0, self.crop_size - image_w)
+        # --------------------------------------------------------
+        # Pad if image smaller than crop
+        # --------------------------------------------------------
+
+        pad_h = max(
+            0,
+            self.crop_size - image_h,
+        )
+
+        pad_w = max(
+            0,
+            self.crop_size - image_w,
+        )
 
         if pad_h > 0 or pad_w > 0:
 
-            # pad format:
-            # (left, right, top, bottom)
             image = F.pad(
                 image,
-                (0, pad_w, 0, pad_h),
+                (
+                    0,
+                    pad_w,
+                    0,
+                    pad_h,
+                ),
                 value=0.0,
             )
 
             density = F.pad(
                 density,
-                (0, pad_w, 0, pad_h),
+                (
+                    0,
+                    pad_w,
+                    0,
+                    pad_h,
+                ),
                 value=0.0,
             )
 
+        # --------------------------------------------------------
+        # Random crop
+        # --------------------------------------------------------
+
         _, h, w = image.shape
 
-        # ------------------------------------------------------
-        # Crop
-        # ------------------------------------------------------
-        if self.train:
+        top = random.randint(
+            0,
+            h - self.crop_size,
+        )
 
-            top = random.randint(
-                0,
-                h - self.crop_size
-            )
-
-            left = random.randint(
-                0,
-                w - self.crop_size
-            )
-
-        else:
-
-            top = (h - self.crop_size) // 2
-            left = (w - self.crop_size) // 2
+        left = random.randint(
+            0,
+            w - self.crop_size,
+        )
 
         bottom = top + self.crop_size
         right = left + self.crop_size
@@ -238,10 +256,11 @@ class ShanghaiTechDensityDataset(Dataset):
             left:right,
         ]
 
-        # ------------------------------------------------------
-        # Horizontal flip
-        # ------------------------------------------------------
-        if self.train and random.random() < 0.5:
+        # --------------------------------------------------------
+        # Random horizontal flip
+        # --------------------------------------------------------
+
+        if random.random() < 0.5:
 
             image = torch.flip(
                 image,
@@ -253,9 +272,10 @@ class ShanghaiTechDensityDataset(Dataset):
                 dims=[2],
             )
 
-        # ------------------------------------------------------
+        # --------------------------------------------------------
         # ImageNet normalization
-        # ------------------------------------------------------
+        # --------------------------------------------------------
+
         image = TF.normalize(
             image,
             mean=IMAGENET_MEAN,
@@ -266,7 +286,182 @@ class ShanghaiTechDensityDataset(Dataset):
 
 
 # ============================================================
-# Train/validation split
+# Full-image validation dataset
+# ============================================================
+
+class ShanghaiTechValidationDataset(Dataset):
+    """
+    Validation uses the COMPLETE image.
+
+    No crop.
+    No augmentation.
+
+    Images are padded only when needed so height and width are
+    divisible by PATCH_SIZE=32.
+
+    The original dimensions are returned so padded pixels can
+    be removed before calculating validation loss/counts.
+    """
+
+    def __init__(
+        self,
+        split_dir,
+        image_files,
+        patch_size=32,
+    ):
+        super().__init__()
+
+        self.split_dir = Path(split_dir)
+
+        self.image_dir = self.split_dir / "images"
+        self.density_dir = self.split_dir / "density_maps"
+
+        self.image_files = list(image_files)
+
+        self.patch_size = patch_size
+
+        if len(self.image_files) == 0:
+            raise RuntimeError(
+                "Validation dataset contains no images."
+            )
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, index):
+
+        image_path = self.image_files[index]
+
+        density_path = (
+            self.density_dir
+            / f"{image_path.stem}.npy"
+        )
+
+        if not density_path.exists():
+            raise FileNotFoundError(
+                f"Density map not found: {density_path}"
+            )
+
+        # --------------------------------------------------------
+        # Load FULL image
+        # --------------------------------------------------------
+
+        image = Image.open(
+            image_path
+        ).convert("RGB")
+
+        image = (
+            TF.pil_to_tensor(image).float()
+            / 255.0
+        )
+
+        # --------------------------------------------------------
+        # Load FULL density map
+        # --------------------------------------------------------
+
+        density = np.load(
+            density_path
+        ).astype(np.float32)
+
+        if density.ndim != 2:
+            raise ValueError(
+                f"Expected 2D density map, "
+                f"got {density.shape} "
+                f"for {density_path}"
+            )
+
+        density = torch.from_numpy(
+            density
+        ).unsqueeze(0)
+
+        # --------------------------------------------------------
+        # Check alignment
+        # --------------------------------------------------------
+
+        _, image_h, image_w = image.shape
+        _, density_h, density_w = density.shape
+
+        if (
+            image_h != density_h
+            or image_w != density_w
+        ):
+            raise ValueError(
+                f"Image/density size mismatch:\n"
+                f"{image_path}: "
+                f"{(image_h, image_w)}\n"
+                f"{density_path}: "
+                f"{(density_h, density_w)}"
+            )
+
+        original_h = image_h
+        original_w = image_w
+
+        # --------------------------------------------------------
+        # ImageNet normalization
+        # --------------------------------------------------------
+
+        image = TF.normalize(
+            image,
+            mean=IMAGENET_MEAN,
+            std=IMAGENET_STD,
+        )
+
+        # --------------------------------------------------------
+        # Pad to nearest multiple of 32
+        # --------------------------------------------------------
+
+        padded_h = (
+            math.ceil(
+                original_h / self.patch_size
+            )
+            * self.patch_size
+        )
+
+        padded_w = (
+            math.ceil(
+                original_w / self.patch_size
+            )
+            * self.patch_size
+        )
+
+        pad_h = padded_h - original_h
+        pad_w = padded_w - original_w
+
+        if pad_h > 0 or pad_w > 0:
+
+            image = F.pad(
+                image,
+                (
+                    0,
+                    pad_w,
+                    0,
+                    pad_h,
+                ),
+                value=0.0,
+            )
+
+            density = F.pad(
+                density,
+                (
+                    0,
+                    pad_w,
+                    0,
+                    pad_h,
+                ),
+                value=0.0,
+            )
+
+        return (
+            image,
+            density,
+            original_h,
+            original_w,
+            image_path.name,
+        )
+
+
+# ============================================================
+# Train / validation split
 # ============================================================
 
 def create_train_val_datasets(
@@ -275,7 +470,10 @@ def create_train_val_datasets(
     seed=42,
 ):
 
-    image_dir = Path(train_dir) / "images"
+    image_dir = (
+        Path(train_dir)
+        / "images"
+    )
 
     image_files = sorted(
         image_dir.glob("*.jpg")
@@ -283,7 +481,8 @@ def create_train_val_datasets(
 
     if len(image_files) == 0:
         raise RuntimeError(
-            f"No training images found in {image_dir}"
+            f"No training images found in "
+            f"{image_dir}"
         )
 
     generator = torch.Generator()
@@ -296,11 +495,19 @@ def create_train_val_datasets(
 
     num_val = max(
         1,
-        int(len(image_files) * val_fraction),
+        int(
+            len(image_files)
+            * val_fraction
+        ),
     )
 
-    val_indices = permutation[:num_val]
-    train_indices = permutation[num_val:]
+    val_indices = (
+        permutation[:num_val]
+    )
+
+    train_indices = (
+        permutation[num_val:]
+    )
 
     train_files = [
         image_files[i]
@@ -312,56 +519,90 @@ def create_train_val_datasets(
         for i in val_indices
     ]
 
-    train_dataset = ShanghaiTechDensityDataset(
-        split_dir=train_dir,
-        image_files=train_files,
-        crop_size=CROP_SIZE,
-        train=True,
+    # --------------------------------------------------------
+    # Training:
+    # random 512x512 crops
+    # --------------------------------------------------------
+
+    train_dataset = (
+        ShanghaiTechTrainDataset(
+            split_dir=train_dir,
+            image_files=train_files,
+            crop_size=CROP_SIZE,
+        )
     )
 
-    val_dataset = ShanghaiTechDensityDataset(
-        split_dir=train_dir,
-        image_files=val_files,
-        crop_size=CROP_SIZE,
-        train=False,
+    # --------------------------------------------------------
+    # Validation:
+    # full images
+    # --------------------------------------------------------
+
+    val_dataset = (
+        ShanghaiTechValidationDataset(
+            split_dir=train_dir,
+            image_files=val_files,
+            patch_size=PATCH_SIZE,
+        )
     )
 
-    print(f"Training images:   {len(train_dataset)}")
-    print(f"Validation images: {len(val_dataset)}")
+    print(
+        f"Training images:   "
+        f"{len(train_dataset)}"
+    )
 
-    return train_dataset, val_dataset
+    print(
+        f"Validation images: "
+        f"{len(val_dataset)}"
+    )
+
+    print(
+        "Training mode:     "
+        "random 512x512 crops"
+    )
+
+    print(
+        "Validation mode:   "
+        "full images"
+    )
+
+    return (
+        train_dataset,
+        val_dataset,
+    )
 
 
 # ============================================================
-# ViT density model
+# ViT density estimator
 # ============================================================
 
 class ViTDensityEstimator(nn.Module):
     """
-    Architecture:
+    ViT-B/32 density estimator.
+
+    For 512x512 training crops:
 
         512x512 RGB
-             |
-             v
+            |
+            v
         ViT patch embedding
-        patch size = 32x32
-             |
-             v
+        patch size = 32
+            |
+            v
         16x16 = 256 patch tokens
-             |
-             v
+            |
+            v
         Transformer blocks
-             |
-             v
+            |
+            v
         Linear(768 -> 1)
-             |
-             v
+            |
+            v
         16x16 coarse density map
-             |
-             v
+            |
+            v
         Bilinear interpolation
-             |
-             v
+            |
+            v
         512x512 density map
     """
 
@@ -376,27 +617,25 @@ class ViTDensityEstimator(nn.Module):
         self.patch_size = patch_size
         self.preserve_mass = preserve_mass
 
-        # ------------------------------------------------------
-        # Pretrained ImageNet ViT
-        # ------------------------------------------------------
+        # --------------------------------------------------------
+        # ImageNet pretrained ViT-B/32
+        # --------------------------------------------------------
+
         self.backbone = timm.create_model(
             model_name,
             pretrained=True,
-
-            # Remove classifier
             num_classes=0,
-
-            # Don't globally pool the tokens.
             global_pool="",
-
-            # Allows 512x512 although pretrained model used 224x224.
             dynamic_img_size=True,
         )
 
-        embedding_dim = self.backbone.num_features
+        embedding_dim = (
+            self.backbone.num_features
+        )
 
         print(
-            f"ViT embedding dimension: {embedding_dim}"
+            f"ViT embedding dimension: "
+            f"{embedding_dim}"
         )
 
         print(
@@ -404,17 +643,15 @@ class ViTDensityEstimator(nn.Module):
             f"{self.backbone.num_prefix_tokens}"
         )
 
-        # ------------------------------------------------------
+        # --------------------------------------------------------
         # Density head
-        #
-        # Each spatial token -> one scalar
-        # ------------------------------------------------------
+        # --------------------------------------------------------
+
         self.density_head = nn.Linear(
             embedding_dim,
             1,
         )
 
-        # Small initialization for the newly-created regression head
         nn.init.normal_(
             self.density_head.weight,
             mean=0.0,
@@ -427,32 +664,52 @@ class ViTDensityEstimator(nn.Module):
 
     def forward(self, x):
 
-        batch_size, _, height, width = x.shape
+        (
+            batch_size,
+            _,
+            height,
+            width,
+        ) = x.shape
+
+        # --------------------------------------------------------
+        # Dimensions must be divisible by 32
+        # --------------------------------------------------------
 
         if (
             height % self.patch_size != 0
-            or width % self.patch_size != 0
+            or
+            width % self.patch_size != 0
         ):
             raise ValueError(
-                f"Input dimensions must be divisible by "
-                f"{self.patch_size}. "
+                f"Input dimensions must be "
+                f"divisible by {self.patch_size}. "
                 f"Got {(height, width)}."
             )
 
-        grid_h = height // self.patch_size
-        grid_w = width // self.patch_size
+        grid_h = (
+            height
+            // self.patch_size
+        )
 
-        # ------------------------------------------------------
-        # ViT
-        #
-        # output:
-        # [B, prefix_tokens + patch_tokens, embedding_dim]
-        # ------------------------------------------------------
-        tokens = self.backbone.forward_features(x)
+        grid_w = (
+            width
+            // self.patch_size
+        )
 
-        # ------------------------------------------------------
-        # Remove CLS token / any other prefix tokens
-        # ------------------------------------------------------
+        # --------------------------------------------------------
+        # ViT feature extraction
+        # --------------------------------------------------------
+
+        tokens = (
+            self.backbone.forward_features(
+                x
+            )
+        )
+
+        # --------------------------------------------------------
+        # Remove CLS / prefix tokens
+        # --------------------------------------------------------
+
         num_prefix_tokens = (
             self.backbone.num_prefix_tokens
         )
@@ -463,30 +720,38 @@ class ViTDensityEstimator(nn.Module):
             :,
         ]
 
-        expected_tokens = grid_h * grid_w
+        expected_tokens = (
+            grid_h * grid_w
+        )
 
-        if patch_tokens.shape[1] != expected_tokens:
+        if (
+            patch_tokens.shape[1]
+            != expected_tokens
+        ):
             raise RuntimeError(
-                f"Expected {expected_tokens} patch tokens, "
-                f"but got {patch_tokens.shape[1]}"
+                f"Expected "
+                f"{expected_tokens} patch tokens, "
+                f"but got "
+                f"{patch_tokens.shape[1]}"
             )
 
-        # ------------------------------------------------------
-        # One scalar per token
-        #
-        # [B, N, D] -> [B, N, 1]
-        # ------------------------------------------------------
+        # --------------------------------------------------------
+        # One scalar per patch
+        # --------------------------------------------------------
+
         coarse = self.density_head(
             patch_tokens
         )
 
-        # ------------------------------------------------------
-        # [B, N, 1]
+        # [B, N, 1] -> [B, 1, N]
+        coarse = coarse.transpose(
+            1,
+            2,
+        )
+
+        # [B, 1, N]
         # ->
         # [B, 1, grid_h, grid_w]
-        # ------------------------------------------------------
-        coarse = coarse.transpose(1, 2)
-
         coarse = coarse.reshape(
             batch_size,
             1,
@@ -494,46 +759,53 @@ class ViTDensityEstimator(nn.Module):
             grid_w,
         )
 
-        # ------------------------------------------------------
-        # Bilinear upsample
-        # ------------------------------------------------------
+        # --------------------------------------------------------
+        # Upsample to input resolution
+        # --------------------------------------------------------
+
         density = F.interpolate(
             coarse,
-            size=(height, width),
+            size=(
+                height,
+                width,
+            ),
             mode="bilinear",
             align_corners=False,
         )
 
-        # ------------------------------------------------------
-        # Density-mass correction
+        # --------------------------------------------------------
+        # Preserve approximate density integral
+        # --------------------------------------------------------
         #
-        # Bilinear interpolation preserves approximately the
-        # average pixel value, not the SUM.
+        # For a 512x512 image:
         #
-        # A 16x16 -> 512x512 upsampling increases the number
-        # of spatial locations by 1024.
+        #     grid = 16x16
         #
-        # Multiplying by:
+        # scale:
         #
-        #     16*16 / (512*512) = 1/1024
+        #     16*16 / (512*512)
+        #     = 1/1024
         #
-        # lets coarse token values behave approximately like
-        # "density mass per patch".
-        # ------------------------------------------------------
+        # --------------------------------------------------------
+
         if self.preserve_mass:
 
             scale = (
                 (grid_h * grid_w)
-                / float(height * width)
+                / float(
+                    height * width
+                )
             )
 
-            density = density * scale
+            density = (
+                density * scale
+            )
 
         return density
 
 
 # ============================================================
-# Loss
+# Density loss
 # ============================================================
 
 def density_loss(
@@ -541,11 +813,6 @@ def density_loss(
     target,
     scale=DENSITY_SCALE,
 ):
-    """
-    Scaling by 1000 only changes the numerical magnitude
-    of the MSE. Predictions themselves remain in the original
-    density-map units.
-    """
 
     return F.mse_loss(
         prediction * scale,
@@ -571,9 +838,14 @@ def train_one_epoch(
     total_mae = 0.0
     total_samples = 0
 
-    amp_enabled = device.type == "cuda"
+    amp_enabled = (
+        device.type == "cuda"
+    )
 
-    for images, targets in loader:
+    for (
+        images,
+        targets,
+    ) in loader:
 
         images = images.to(
             device,
@@ -589,73 +861,102 @@ def train_one_epoch(
             set_to_none=True
         )
 
-        # ------------------------------------------------------
+        # --------------------------------------------------------
         # Forward
-        # ------------------------------------------------------
+        # --------------------------------------------------------
+
         with torch.autocast(
             device_type=device.type,
             dtype=torch.float16,
             enabled=amp_enabled,
         ):
 
-            predictions = model(images)
+            predictions = model(
+                images
+            )
 
             loss = density_loss(
                 predictions,
                 targets,
             )
 
-        # ------------------------------------------------------
-        # Backprop
-        # ------------------------------------------------------
-        scaler.scale(loss).backward()
+        # --------------------------------------------------------
+        # Backpropagation
+        # --------------------------------------------------------
 
-        scaler.unscale_(optimizer)
+        scaler.scale(
+            loss
+        ).backward()
+
+        scaler.unscale_(
+            optimizer
+        )
 
         torch.nn.utils.clip_grad_norm_(
             model.parameters(),
             max_norm=1.0,
         )
 
-        scaler.step(optimizer)
+        scaler.step(
+            optimizer
+        )
+
         scaler.update()
 
-        # ------------------------------------------------------
-        # Count metric
-        #
-        # integral of density map = crowd count
-        # ------------------------------------------------------
+        # --------------------------------------------------------
+        # Training crop MAE
+        # --------------------------------------------------------
+
         with torch.no_grad():
 
-            predicted_counts = predictions.sum(
-                dim=(1, 2, 3)
+            predicted_counts = (
+                predictions.sum(
+                    dim=(1, 2, 3)
+                )
             )
 
-            target_counts = targets.sum(
-                dim=(1, 2, 3)
+            target_counts = (
+                targets.sum(
+                    dim=(1, 2, 3)
+                )
             )
 
             mae = torch.abs(
-                predicted_counts - target_counts
+                predicted_counts
+                - target_counts
             ).sum()
 
-        batch_size = images.shape[0]
-
-        total_loss += (
-            loss.item() * batch_size
+        batch_size = (
+            images.shape[0]
         )
 
-        total_mae += mae.item()
-        total_samples += batch_size
+        total_loss += (
+            loss.item()
+            * batch_size
+        )
+
+        total_mae += (
+            mae.item()
+        )
+
+        total_samples += (
+            batch_size
+        )
 
     return {
-        "loss": total_loss / total_samples,
-        "mae": total_mae / total_samples,
+        "loss": (
+            total_loss
+            / total_samples
+        ),
+        "mae": (
+            total_mae
+            / total_samples
+        ),
     }
 
 
 # ============================================================
-# Validation
+# Full-image validation
 # ============================================================
 
 @torch.no_grad()
@@ -668,13 +969,27 @@ def validate(
     model.eval()
 
     total_loss = 0.0
+
     total_absolute_error = 0.0
     total_squared_error = 0.0
+
     total_samples = 0
 
-    amp_enabled = device.type == "cuda"
+    amp_enabled = (
+        device.type == "cuda"
+    )
 
-    for images, targets in loader:
+    print(
+        "\nValidating on full images...\n"
+    )
+
+    for (
+        images,
+        targets,
+        original_h,
+        original_w,
+        filenames,
+    ) in loader:
 
         images = images.to(
             device,
@@ -686,46 +1001,129 @@ def validate(
             non_blocking=True,
         )
 
+        if images.shape[0] != 1:
+            raise RuntimeError(
+                "Full-image validation requires "
+                "VAL_BATCH_SIZE = 1."
+            )
+
+        original_h = int(
+            original_h[0].item()
+        )
+
+        original_w = int(
+            original_w[0].item()
+        )
+
+        # --------------------------------------------------------
+        # Forward on complete padded image
+        # --------------------------------------------------------
+
         with torch.autocast(
             device_type=device.type,
             dtype=torch.float16,
             enabled=amp_enabled,
         ):
 
-            predictions = model(images)
-
-            loss = density_loss(
-                predictions,
-                targets,
+            predictions = model(
+                images
             )
 
-        predicted_counts = predictions.sum(
-            dim=(1, 2, 3)
+        # --------------------------------------------------------
+        # Remove padding
+        # --------------------------------------------------------
+
+        predictions = predictions[
+            :,
+            :,
+            :original_h,
+            :original_w,
+        ]
+
+        targets = targets[
+            :,
+            :,
+            :original_h,
+            :original_w,
+        ]
+
+        # --------------------------------------------------------
+        # Full-image density loss
+        # --------------------------------------------------------
+
+        loss = density_loss(
+            predictions,
+            targets,
         )
 
-        target_counts = targets.sum(
-            dim=(1, 2, 3)
+        # --------------------------------------------------------
+        # FULL IMAGE crowd count
+        # --------------------------------------------------------
+
+        predicted_counts = (
+            predictions.sum(
+                dim=(1, 2, 3)
+            )
+        )
+
+        target_counts = (
+            targets.sum(
+                dim=(1, 2, 3)
+            )
         )
 
         errors = (
-            predicted_counts - target_counts
+            predicted_counts
+            - target_counts
         )
 
-        batch_size = images.shape[0]
+        absolute_errors = (
+            errors.abs()
+        )
+
+        squared_errors = (
+            errors ** 2
+        )
+
+        batch_size = (
+            predictions.shape[0]
+        )
 
         total_loss += (
-            loss.item() * batch_size
+            loss.item()
+            * batch_size
         )
 
         total_absolute_error += (
-            errors.abs().sum().item()
+            absolute_errors
+            .sum()
+            .item()
         )
 
         total_squared_error += (
-            (errors ** 2).sum().item()
+            squared_errors
+            .sum()
+            .item()
         )
 
-        total_samples += batch_size
+        total_samples += (
+            batch_size
+        )
+
+        # --------------------------------------------------------
+        # Individual validation image
+        # --------------------------------------------------------
+
+        print(
+            f"{filenames[0]:15s} "
+            f"GT={target_counts[0].item():8.2f} "
+            f"Pred={predicted_counts[0].item():8.2f} "
+            f"Error={errors[0].item():+8.2f}"
+        )
+
+    # ------------------------------------------------------------
+    # Final metrics
+    # ------------------------------------------------------------
 
     mae = (
         total_absolute_error
@@ -738,7 +1136,10 @@ def validate(
     )
 
     return {
-        "loss": total_loss / total_samples,
+        "loss": (
+            total_loss
+            / total_samples
+        ),
         "mae": mae,
         "rmse": rmse,
     }
@@ -753,24 +1154,33 @@ def main():
     # ----------------------------------------------------------
     # Device
     # ----------------------------------------------------------
+
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
         else "cpu"
     )
 
-    print(f"Device: {device}")
+    print(
+        f"Device: {device}"
+    )
 
     # ----------------------------------------------------------
     # Datasets
     # ----------------------------------------------------------
-    train_dataset, val_dataset = (
-        create_train_val_datasets(
-            TRAIN_DIR,
-            val_fraction=VAL_FRACTION,
-            seed=SEED,
-        )
+
+    (
+        train_dataset,
+        val_dataset,
+    ) = create_train_val_datasets(
+        TRAIN_DIR,
+        val_fraction=VAL_FRACTION,
+        seed=SEED,
     )
+
+    # ----------------------------------------------------------
+    # Training loader
+    # ----------------------------------------------------------
 
     train_loader = DataLoader(
         train_dataset,
@@ -781,9 +1191,16 @@ def main():
         drop_last=True,
     )
 
+    # ----------------------------------------------------------
+    # Validation loader
+    #
+    # Full images have different dimensions,
+    # therefore batch size must be 1.
+    # ----------------------------------------------------------
+
     val_loader = DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=VAL_BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=torch.cuda.is_available(),
@@ -792,40 +1209,59 @@ def main():
     # ----------------------------------------------------------
     # Model
     # ----------------------------------------------------------
+
     model = ViTDensityEstimator(
         model_name=MODEL_NAME,
         patch_size=PATCH_SIZE,
         preserve_mass=True,
     )
 
-    model = model.to(device)
+    model = model.to(
+        device
+    )
 
     # ----------------------------------------------------------
-    # Separate LR:
-    #
-    # pretrained transformer = smaller LR
-    # new density head       = larger LR
+    # Optimizer
     # ----------------------------------------------------------
+
     optimizer = torch.optim.AdamW(
         [
             {
-                "params": model.backbone.parameters(),
-                "lr": BACKBONE_LR,
+                "params":
+                    model.backbone.parameters(),
+
+                "lr":
+                    BACKBONE_LR,
             },
             {
-                "params": model.density_head.parameters(),
-                "lr": HEAD_LR,
+                "params":
+                    model.density_head.parameters(),
+
+                "lr":
+                    HEAD_LR,
             },
         ],
         weight_decay=WEIGHT_DECAY,
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=EPOCHS,
+    # ----------------------------------------------------------
+    # Scheduler
+    # ----------------------------------------------------------
+
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=EPOCHS,
+        )
     )
 
-    amp_enabled = device.type == "cuda"
+    # ----------------------------------------------------------
+    # Mixed precision
+    # ----------------------------------------------------------
+
+    amp_enabled = (
+        device.type == "cuda"
+    )
 
     scaler = torch.amp.GradScaler(
         "cuda",
@@ -833,15 +1269,26 @@ def main():
     )
 
     # ----------------------------------------------------------
-    # Sanity check
+    # Training sanity check
     # ----------------------------------------------------------
+
     images, targets = next(
         iter(train_loader)
     )
 
-    print("\nSanity check:")
-    print("Images:", images.shape)
-    print("Targets:", targets.shape)
+    print(
+        "\nTraining sanity check:"
+    )
+
+    print(
+        "Images:",
+        images.shape,
+    )
+
+    print(
+        "Targets:",
+        targets.shape,
+    )
 
     with torch.no_grad():
 
@@ -849,32 +1296,123 @@ def main():
             images[:1].to(device)
         )
 
-    print("Output:", output.shape)
+    print(
+        "Output:",
+        output.shape,
+    )
 
     print(
-        "Target count:",
+        "Target crop count:",
         targets[0].sum().item(),
     )
 
     print(
-        "Initial predicted count:",
+        "Initial predicted crop count:",
         output[0].sum().item(),
     )
 
     # ----------------------------------------------------------
-    # Training
+    # Validation sanity check
     # ----------------------------------------------------------
+
+    (
+        val_image,
+        val_target,
+        val_h,
+        val_w,
+        val_filename,
+    ) = next(
+        iter(val_loader)
+    )
+
+    print(
+        "\nFull-image validation sanity check:"
+    )
+
+    print(
+        "Filename:",
+        val_filename[0],
+    )
+
+    print(
+        "Padded image shape:",
+        val_image.shape,
+    )
+
+    print(
+        "Padded target shape:",
+        val_target.shape,
+    )
+
+    original_h = int(
+        val_h[0].item()
+    )
+
+    original_w = int(
+        val_w[0].item()
+    )
+
+    print(
+        "Original image size:",
+        (
+            original_h,
+            original_w,
+        ),
+    )
+
+    print(
+        "Full-image GT count:",
+        val_target[
+            :,
+            :,
+            :original_h,
+            :original_w,
+        ].sum().item(),
+    )
+
+    # ----------------------------------------------------------
+    # Training loop
+    # ----------------------------------------------------------
+
     best_mae = float("inf")
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(
+        1,
+        EPOCHS + 1,
+    ):
 
-        train_metrics = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            scaler=scaler,
-            device=device,
+        print(
+            "\n"
+            + "=" * 70
         )
+
+        print(
+            f"Epoch "
+            f"{epoch:03d}/"
+            f"{EPOCHS:03d}"
+        )
+
+        print(
+            "=" * 70
+        )
+
+        # ------------------------------------------------------
+        # Train
+        # ------------------------------------------------------
+
+        train_metrics = (
+            train_one_epoch(
+                model=model,
+                loader=train_loader,
+                optimizer=optimizer,
+                scaler=scaler,
+                device=device,
+            )
+        )
+
+        # ------------------------------------------------------
+        # Full-image validation
+        # ------------------------------------------------------
 
         val_metrics = validate(
             model=model,
@@ -882,33 +1420,82 @@ def main():
             device=device,
         )
 
+        # ------------------------------------------------------
+        # Scheduler
+        # ------------------------------------------------------
+
         scheduler.step()
 
+        # ------------------------------------------------------
+        # Epoch summary
+        # ------------------------------------------------------
+
         print(
-            f"\nEpoch {epoch:03d}/{EPOCHS:03d} | "
-            f"train_loss={train_metrics['loss']:.6f} | "
-            f"train_MAE={train_metrics['mae']:.3f} | "
-            f"val_loss={val_metrics['loss']:.6f} | "
-            f"val_MAE={val_metrics['mae']:.3f} | "
-            f"val_RMSE={val_metrics['rmse']:.3f}"
+            "\n"
+            + "-" * 70
+        )
+
+        print(
+            f"Epoch "
+            f"{epoch:03d}/"
+            f"{EPOCHS:03d} | "
+            f"train_loss="
+            f"{train_metrics['loss']:.6f} | "
+            f"train_crop_MAE="
+            f"{train_metrics['mae']:.3f} | "
+            f"val_loss="
+            f"{val_metrics['loss']:.6f} | "
+            f"val_full_MAE="
+            f"{val_metrics['mae']:.3f} | "
+            f"val_full_RMSE="
+            f"{val_metrics['rmse']:.3f}"
+        )
+
+        print(
+            "-" * 70
         )
 
         # ------------------------------------------------------
-        # Save best model according to validation count MAE
+        # Save best model according to FULL-IMAGE validation MAE
         # ------------------------------------------------------
-        if val_metrics["mae"] < best_mae:
 
-            best_mae = val_metrics["mae"]
+        if (
+            val_metrics["mae"]
+            < best_mae
+        ):
+
+            best_mae = (
+                val_metrics["mae"]
+            )
 
             checkpoint = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_mae": val_metrics["mae"],
-                "val_rmse": val_metrics["rmse"],
-                "model_name": MODEL_NAME,
-                "crop_size": CROP_SIZE,
-                "patch_size": PATCH_SIZE,
+
+                "epoch":
+                    epoch,
+
+                "model_state_dict":
+                    model.state_dict(),
+
+                "optimizer_state_dict":
+                    optimizer.state_dict(),
+
+                "val_mae":
+                    val_metrics["mae"],
+
+                "val_rmse":
+                    val_metrics["rmse"],
+
+                "model_name":
+                    MODEL_NAME,
+
+                "crop_size":
+                    CROP_SIZE,
+
+                "patch_size":
+                    PATCH_SIZE,
+
+                "validation_mode":
+                    "full_image",
             }
 
             torch.save(
@@ -917,10 +1504,15 @@ def main():
             )
 
             print(
-                f"Saved best model "
-                f"(MAE={best_mae:.3f})"
+                "\nSaved best model "
+                f"(full-image validation "
+                f"MAE={best_mae:.3f})"
             )
 
+
+# ============================================================
+# Run
+# ============================================================
 
 if __name__ == "__main__":
     main()
